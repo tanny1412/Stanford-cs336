@@ -252,4 +252,250 @@ This is why training still costs 16 bytes/param even with mixed precision — fp
 
 ---
 
+### 13. Mixed Precision — Exact Memory Breakdown
+
+At peak memory during training, both bf16 and fp32 copies of weights exist simultaneously:
+
+```
+bf16 weights         2 bytes/param   (forward/backward pass)
+fp32 master weights  4 bytes/param   (optimizer step)
+fp32 gradients       4 bytes/param
+fp32 m               4 bytes/param
+fp32 v               4 bytes/param
+──────────────────────────────────
+total               18 bytes/param
+```
+
+The rough estimate of 16 bytes/param ignores the bf16 working copy. Strictly it's 18.
+
+The tradeoff is still worth it because:
+- Forward/backward is much faster in bf16
+- Activations are stored in bf16 → big memory saving since activations can be huge
+- Extra 2 bytes for the bf16 copy is a small price for the speed gain
+
+**Exact AdamW optimizer step:**
+```
+1. forward pass             (bf16)
+2. backward pass            (bf16)
+3. gradients computed       (bf16)
+         ↓ cast to fp32
+4. m = β₁×m + (1-β₁)×grad  (fp32)  ← optimizer state update
+   v = β₂×v + (1-β₂)×grad² (fp32)  ← optimizer state update
+         ↓
+5. w = w - lr × m/√v        (fp32)  ← weight update
+         ↓ cast to bf16
+6. next forward pass        (bf16)
+```
+
+---
+
+### 14. Tensors — Under the Hood
+
+A tensor is just a **pointer to a flat contiguous block of GPU memory** + metadata:
+
+```
+pointer   → where in GPU memory the data starts
+shape     → (3, 224, 224)
+dtype     → bf16, fp32 etc
+stride    → how to step through memory for each dimension
+```
+
+**Strides example:**
+
+Flat memory: `[1, 2, 3, 4, 5, 6]`
+
+Shape `(2, 3)` with strides `(3, 1)` means:
+- Next row → jump 3 elements
+- Next column → jump 1 element
+
+So the 2D matrix is just a view into flat memory — no data is duplicated.
+
+**Key insight:** reshaping a tensor doesn't move any data — it just changes shape and stride metadata. Reshape is basically free.
+
+This is why GPU memory management matters — contiguous memory, in-place operations, and memory fragmentation all affect performance.
+
+---
+
+### 15. Tensor Views — Shared Memory
+
+Two tensors can point to the same GPU memory. Changing one changes the other:
+
+```python
+x = torch.tensor([1.0, 2.0, 3.0])
+y = x.view(3)       # same memory as x
+x[0] = 99.0
+print(y)            # tensor([99., 2., 3.])
+```
+
+Operations that return **views** (same memory):
+```python
+x.view(...)
+x.reshape(...)      # usually a view
+x.transpose(...)
+x[:]                # slicing
+```
+
+Operations that return **copies** (new memory):
+```python
+x.clone()
+x.contiguous()
+```
+
+Common bug: modifying a slice thinking it's independent but it's a view — silently mutates original tensor. Use `.clone()` when in doubt.
+
+---
+
+### 16. Batch Size vs Sequence Length
+
+- **Sequence length** — how many tokens one sentence has
+- **Batch size** — how many sentences in one batch
+
+```
+(batch_size, sequence_length)
+     ↑               ↑
+how many          how many tokens
+sentences         per sentence
+```
+
+All sequences in a batch must be the same length → shorter ones get padded with `[PAD]` token:
+```
+"The cat sat"  → [The, cat, sat]
+"Hello world"  → [Hello, world, PAD]
+
+tensor shape: (2, 3)
+```
+
+---
+
+### 17. Einops — Motivation and rearrange
+
+**Problem:** `permute(0, 2, 1, 3).reshape(...)` is unreadable and error-prone. Hard to track what each dimension index means.
+
+**Einops solution:** name your dimensions explicitly.
+
+```python
+# old way
+x.permute(0, 2, 1, 3).reshape(batch, seq, heads*d_head)
+
+# einops
+rearrange(x, 'batch heads seq d_head -> batch seq (heads d_head)')
+```
+
+**rearrange examples:**
+```python
+# transpose
+rearrange(x, 'batch seq -> seq batch')
+
+# merge dimensions
+rearrange(x, 'batch seq features -> batch (seq features)')
+
+# split a dimension
+rearrange(x, 'batch (seq features) -> batch seq features', seq=3, features=4)
+```
+
+Pattern: `'input_shape -> output_shape'` with named dimensions. Also validates shapes at runtime — throws error immediately if tensor doesn't match.
+
+---
+
+### 18. MFU and Multi-GPU Communication
+
+**MFU = actual FLOPs/sec ÷ theoretical peak FLOPs/sec**
+
+More GPUs → more gradient synchronization + communication overhead → GPUs sit idle waiting → actual FLOPs/sec drops → MFU goes down.
+
+```
+1 GPU:     MFU ~0.5
+8 GPUs:    MFU ~0.45
+64 GPUs:   MFU ~0.4
+1024 GPUs: MFU ~0.3
+```
+
+Scaling is not linear — communication cost grows with GPU count.
+
+Why interconnect speed matters:
+- **NVLink** (GPU→GPU inside a node) — fast
+- **InfiniBand** (GPU→GPU across nodes) — slower → MFU drops when going multi-node
+
+Keeping MFU high at thousands of GPUs is one of the core engineering challenges in large scale training.
+
+---
+
+### 19. Backward Pass — Gradient Flow Between Layers
+
+For every layer, two gradients are computed:
+- **dL/dW** — gradient w.r.t. weights → used to update that layer's weights
+- **dL/dx** — gradient w.r.t. inputs → passed to the previous layer
+
+The `dL/dx` received from the layer ahead is used for **both**:
+
+```
+received from Layer 3:   dL/dx  (how loss changes w.r.t. Layer 2's output)
+Layer 2 knows:           its own input (saved activation from forward pass)
+
+computes:
+  dL/dW₂ = dL/dx × input₂ᵀ    ← update W₂
+  dL/dx₂ = W₂ᵀ × dL/dx        ← pass back to Layer 1
+```
+
+**Important:** `W₂ᵀ` used here is the **original W₂** from the forward pass, not the updated one. Weights are only updated after the entire backward pass is complete:
+
+```
+1. forward pass   → use W₂ (save activations)
+2. backward pass  → use same W₂ to compute gradients
+3. optimizer step → NOW update W₂ using dL/dW₂
+```
+
+dL/dx is the messenger — each layer consumes the gradient from the layer ahead and produces a new one for the layer behind.
+
+---
+
+### 20. AdamW Optimizer Step (corrected)
+
+`dL/dW` is the input to the optimizer — m and v are computed using it each step:
+
+```
+backward pass → collect dL/dW for every layer
+                      ↓
+optimizer step → for each layer:
+                   1. m = β₁×m + (1-β₁)×dL/dW    ← update 1st moment
+                   2. v = β₂×v + (1-β₂)×(dL/dW)² ← update 2nd moment
+                   3. W = W - lr × m/√v            ← update weights
+```
+
+dL/dx — only exists to carry signal backwards, never used to update anything.
+dL/dW — the only thing that matters, one per layer, fed into the optimizer.
+
+---
+
+### 21. Parameter Initialization — Xavier
+
+**The problem:**
+
+Each output element is a sum of `input_dim` terms:
+```
+output_j = x₁w₁ + x₂w₂ + ... + xₙwₙ
+```
+
+When you sum n random numbers, the result grows as √n. So with `input_dim = 2873`, outputs scale to `√2873 ≈ 53`. Large outputs → large gradients → unstable training.
+
+**The fix — Xavier initialization:**
+
+Divide weights by √(input_dim) to cancel the growth:
+```python
+w = torch.randn(input_dim, hidden_dim) / np.sqrt(input_dim)
+```
+
+```
+output grows by √n
+weights shrunk by √n
+────────────────────
+net effect = 1   ✓
+```
+
+Output stays ~constant regardless of layer width.
+
+**Truncate to [-3, 3]:** `torch.randn` can produce extreme outliers (e.g. 5, -6) which cause output spikes even after scaling. Truncating clips them.
+
+---
+
 ## Questions / Follow-up
