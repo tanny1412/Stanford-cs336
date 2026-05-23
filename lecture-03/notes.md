@@ -400,4 +400,16 @@ Used by GPT-3, Longformer for long context efficiency.
 
 ---
 
+### 22. Why LayerNorm / RMSNorm — Two Benefits
+
+**1. Training stability**
+Values can grow very large or small across many layers → large gradients → weights update too aggressively → training diverges. Norm keeps values in a controlled range at every layer.
+
+**2. Faster convergence**
+Without norm, each layer wastes steps adapting to the scale of its inputs rather than learning the actual task. Normalized inputs → each layer focuses on learning useful transformations from the start.
+
+One line: without norm, deep networks are hard to train and unstable. With norm, they train faster and more reliably.
+
+---
+
 ## Questions / Follow-up
