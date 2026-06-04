@@ -615,4 +615,52 @@ GRPO replaces the value model (with group average). In RLVR, the reward model is
 
 ---
 
+---
+
+### 28. WSD Learning Rate Schedule (Warmup-Stable-Decay)
+
+**The problem with cosine LR for scaling experiments:**
+To do Chinchilla analysis you need to train models on different amounts of data. With cosine, each data target needs a completely different LR schedule — you can't reuse checkpoints from one run to measure different data sizes. That means N² training runs.
+
+**WSD fixes this:**
+```
+Phase 1: Warmup   → ramp up LR (same as cosine)
+Phase 2: Stable   → flat LR (the long middle part)
+Phase 3: Decay    → rapid cooldown to near zero
+```
+
+The stable phase can be reused. To measure different data sizes:
+```
+Run one long training run (warmup → stable → end)
+Want to know: "how would my model look with less data?"
+→ rewind to an earlier checkpoint in the stable phase
+→ apply a short decay from there
+→ done — exact WSD shape without retraining from scratch
+```
+
+This turns N² runs into roughly 1 run. Popularized by MiniCPM, now widely adopted.
+
+**Training curve looks weird with WSD:** loss stays high during stable phase, then drops sharply during decay. Normal — the cooldown phase is where most of the loss improvement happens. Cosine and WSD give roughly similar final loss, but WSD is far cheaper for scaling experiments.
+
+---
+
+### 29. Chinchilla 20:1 Is Just a Starting Point
+
+The 20 tokens per parameter ratio from Chinchilla is not a hard rule — it keeps shifting as architectures and data quality improve:
+
+```
+Chinchilla (2022):  ~20 tokens per parameter
+Llama 3 (2024):     ~39 tokens per parameter
+MiniCPM (2024):     ~192 tokens per parameter (outlier, but direction is clear)
+```
+
+Why it shifts:
+- Better data quality → model learns more per token → can push ratio higher
+- Better architectures → more efficient learners → same compute, more tokens worth it
+- Models served at inference want to be small → train smaller model longer = cheaper to serve
+
+**Key takeaway:** don't treat 20:1 as a constraint. With careful optimization, you can go far beyond it. Recent frontier models consistently train at much higher token-to-parameter ratios.
+
+---
+
 ## Questions / Follow-up
