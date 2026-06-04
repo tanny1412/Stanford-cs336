@@ -120,4 +120,20 @@ From looking across multiple labs:
 
 ---
 
+---
+
+## Glossary
+
+**WSD Schedule (Warmup-Stable-Decay):** LR schedule with three phases — warmup, flat stable phase, rapid decay. Stable phase can be rewound to simulate different data sizes without retraining, making Chinchilla analysis cheap. Now standard in most labs.
+
+**muP (Maximal Update Parametrization):** Initialize and set per-layer LRs so optimal LR stays the same as model width scales up. Key change: instead of one global LR, each layer gets its own LR scaled by 1/width. Tune on small model, works at any scale.
+
+**Isoflops Analysis:** Fix a compute budget, train models of different sizes, find which size gives lowest loss. The minimum gives optimal parameter-to-token ratio for that budget. Most reliable piece of scaling law work — always fits cleanly.
+
+**Chinchilla Ratio:** Optimal tokens-to-parameters ratio. Chinchilla said 20:1 but keeps shifting — Llama 3 uses 39:1, others go higher. Treat as a starting point not a rule. Direction is clear: more tokens per parameter than Chinchilla suggested.
+
+**Proxy Model:** A tiny model (e.g. 40M params) used to tune hyperparameters cheaply before scaling up. Works because muP makes those hyperparameters transfer to larger models.
+
+---
+
 ## Questions / Follow-up
