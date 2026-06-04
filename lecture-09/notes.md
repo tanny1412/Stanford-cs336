@@ -534,4 +534,85 @@ This ensures your scaling curve measures actual model quality at each compute le
 
 ---
 
+---
+
+## Bonus — RLHF vs RLVR vs DPO vs GRPO
+
+### RLHF
+- Humans rate outputs (A vs B)
+- Train a reward model on those ratings
+- Use RL to make the LLM score higher on that reward model
+- Problem: model can game the reward model (reward hacking)
+
+### DPO
+- You have (good output, bad output) pairs for the same prompt
+- Directly pushes model to prefer good over bad
+- Offline — fixed dataset, no exploration
+- Still needs human preference pairs
+- About shaping style and tone, not developing reasoning
+
+### RLVR
+- Reward comes from verifiable correctness — math answer right/wrong, code passes tests or not
+- Online — model generates attempts during training, gets feedback, learns in real time
+- No reward model needed, no human labels needed
+- The model explores and discovers solutions
+- What gave DeepSeek-R1 and o1 their reasoning ability
+
+**RLHF vs RLVR:** RLHF = reward from human opinion (subjective, can be hacked). RLVR = reward from objective correctness (verifiable, can't be faked).
+
+**DPO vs RLVR:** DPO teaches from fixed examples of good/bad. RLVR lets model explore and discover. DPO can't teach a model to reason through new problems — only imitate existing good answers.
+
+---
+
+### How RLVR Actually Works (GRPO)
+
+**Dataset:** just prompts + correct answers. No reasoning chains, no model outputs.
+```
+Prompt: "Solve: x² + 5x + 6 = 0"
+Answer: x = -2 or x = -3   ← just ground truth to check against
+```
+
+**Training loop:**
+```
+1. Take a problem
+2. Run inference on current model → generate 8 attempts
+3. Check each attempt against ground truth → reward 1 (correct) or 0 (wrong)
+4. Compute group average (say 0.75)
+5. Normalize: each attempt score = reward - group average
+6. Gradient update: reinforce above-average, penalize below-average
+7. KL penalty: don't drift too far from SFT model
+8. Repeat for millions of problems
+```
+
+**Why reasoning chains emerge:** nobody put reasoning chains in the prompt or target. The model learned step-by-step reasoning during pretraining (from textbooks, math solutions, proofs). RLVR just selects for it — reasoned attempts are correct more often → score above average → get reinforced → reasoning dominates over time.
+
+---
+
+### Why GRPO and not PPO or DPO?
+
+**PPO needs two models:**
+```
+Policy model  → generates text
+Value model   → estimates future reward (same size as policy) ← expensive
+```
+Double the memory, double the compute, unstable.
+
+**DPO:** offline, needs fixed (chosen, rejected) pairs. Doesn't fit RLVR where you're generating outputs on the fly and checking correctness in real time.
+
+**GRPO:** replaces the value model with the group average as a baseline:
+```
+PPO:  baseline = value model (separate trained model)
+GRPO: baseline = group average of the 8 attempts → free, no extra model
+```
+
+No value model → half the memory, more stable training, works naturally with verifiable rewards.
+
+**Note — PPO has two separate things:**
+- Reward model → checks if output is good
+- Value model → estimates future reward, used as baseline to reduce variance
+
+GRPO replaces the value model (with group average). In RLVR, the reward model is also replaced by verifiable correctness. So both are gone.
+
+---
+
 ## Questions / Follow-up
